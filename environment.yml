@@ -1,0 +1,24 @@
+name: alphaedit
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pytorch
+  - pytorch-cuda=12.1
+  - pip
+  - pip:
+      - einops==0.8.1
+      - higher==0.2.1
+      - hydra-core==1.3.2
+      - transformers
+      - datasets
+      - matplotlib
+      - spacy==3.4.1
+      - scipy
+      - scikit-learn
+      - nltk
+      - sentencepiece
+      - accelerate
+      - tqdm
