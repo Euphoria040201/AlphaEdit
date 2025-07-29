@@ -9,3 +9,10 @@ data/
 **/*.tar
 **/*.zip
 
+# heavy artifacts
+**/*.npz
+**/*.pkl
+meta-llama-3-8b-instruct/
+# optional: logs & local junk
+*.log
+.ipynb_checkpoints/
