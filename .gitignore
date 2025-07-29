@@ -1,0 +1,11 @@
+results/
+results/
+wandb/
+runs/
+data/
+**/*.pt
+**/*.bin
+**/*.safetensors
+**/*.tar
+**/*.zip
+
