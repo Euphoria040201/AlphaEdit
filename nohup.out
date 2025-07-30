@@ -1,0 +1,13 @@
+/root/autodl-tmp/miniconda3/envs/alphaedit/lib/python3.10/site-packages/transformers/utils/hub.py:111: FutureWarning: Using `TRANSFORMERS_CACHE` is deprecated and will be removed in v5 of Transformers. Use `HF_HOME` instead.
+  warnings.warn(
+usage: evaluate.py [-h] --alg_name
+                   {AlphaEdit,MEMIT_rect,MEMIT_seq,MEMIT_prune,MEMIT,ROME,FT,MEND,NSE}
+                   --model_name MODEL_NAME --hparams_fname HPARAMS_FNAME
+                   [--ds_name {mcf,cf,zsre,mquake}]
+                   [--continue_from_run CONTINUE_FROM_RUN]
+                   [--dataset_size_limit DATASET_SIZE_LIMIT]
+                   [--skip_generation_tests]
+                   [--generation_test_interval GENERATION_TEST_INTERVAL]
+                   [--conserve_memory] [--num_edits NUM_EDITS] [--use_cache]
+                   [--downstream_eval_steps DOWNSTREAM_EVAL_STEPS]
+evaluate.py: error: unrecognized arguments:  

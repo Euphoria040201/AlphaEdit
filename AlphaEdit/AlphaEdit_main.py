@@ -111,6 +111,15 @@ def apply_AlphaEdit_to_model(
         layer_ks = compute_ks(model, tok, requests, hparams, layer, context_templates).T
         print(f"Writing {layer_ks.size(1)} key/value pair(s) into layer {layer}")
 
+
+        # === 取该层的 H = E[aa^T]（与 GPTQ 同源的 mom2） ===
+        layer_name = hparams.rewrite_module_tmp.format(layer)
+        H = get_cov(
+            model, tok, layer_name,
+            hparams.mom2_dataset, hparams.mom2_n_samples, hparams.mom2_dtype,
+            inv=False, force_recompute=False
+        ).to(layer_ks.device, dtype=torch.float32)  # [d_in, d_in]
+
         # Compute residual error
         cur_zs = get_module_input_output_at_words(
             model,
@@ -127,9 +136,21 @@ def apply_AlphaEdit_to_model(
         repeat_factor = (layer_ks.size(1) // targets.size(1))
         targets = targets.repeat_interleave(repeat_factor, dim=1)
         resid = targets / (len(hparams.layers) - i)  # Distribute residual across layers
-        upd_matrix = torch.linalg.solve(
-                P[i,:,:].cuda() @ (layer_ks @ layer_ks.T + cache_c[i,:,:].cuda()) + hparams.L2*torch.eye(layer_ks.shape[0], dtype=torch.float,device="cuda"), P[i,:,:].cuda() @ layer_ks @ resid.T
-        )
+#        upd_matrix = torch.linalg.solve(
+#                P[i,:,:].cuda() @ (layer_ks @ layer_ks.T + cache_c[i,:,:].cuda()) + hparams.L2*torch.eye(layer_ks.shape[0], dtype=torch.float,device="cuda"), P[i,:,:].cuda() @ layer_ks @ resid.T
+#        )
+                # === αI → αH：用 H 做加权正则，并加一个很小的 εI 保证数值稳定 ===
+        d_in = layer_ks.shape[0]
+        KKt  = (layer_ks @ layer_ks.T).to(torch.float32)                       # [d_in, d_in]
+        Ccum =  cache_c[i,:,:].to(layer_ks.device, dtype=torch.float32)        # [d_in, d_in]
+        Acore = KKt + Ccum + hparams.L2 * H                                    # αH 取代 αI
+        P_i  =  P[i,:,:].to(layer_ks.device, dtype=torch.float32)
+        epsI = 1e-6 * torch.eye(d_in, device=layer_ks.device, dtype=torch.float32)
+        A = P_i @ Acore + epsI
+        B = P_i @ layer_ks.to(torch.float32) @ resid.T.to(torch.float32)       # [d_in, d_out]
+        upd_matrix = torch.linalg.solve(A, B)
+
+
         # Adjust update matrix shape
         weight_name = f"{hparams.rewrite_module_tmp.format(layer)}.weight"
         upd_matrix = upd_matrix_match_shape(upd_matrix, weights[weight_name].shape)
@@ -139,7 +160,8 @@ def apply_AlphaEdit_to_model(
             weights[weight_name][...] = weights[weight_name] + upd_matrix
         # Clear GPU memory
         #del U,S,cov
-        for x in [layer_ks, cur_zs, targets, upd_matrix]:
+        #for x in [layer_ks, cur_zs, targets, upd_matrix]:
+        for x in [layer_ks, cur_zs, targets, upd_matrix, H, KKt, Ccum, A, B]:
             x.cpu()
             del x
         torch.cuda.empty_cache()
