@@ -8,6 +8,7 @@ from typing import Tuple, Union
 import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from pathlib import Path
 
 from baselines.ft import FTHyperParams, apply_ft_to_model
 from baselines.mend import MENDHyperParams, MendRewriteExecutor
@@ -55,6 +56,62 @@ DS_DICT = {
     "mquake": (MQUAKEDataset, compute_rewrite_quality_mquake),
 }
 
+# ---------- BEGIN: robust metric extractors ----------
+import numpy as np
+
+def _first_number(x):
+    """从标量、(均值,方差)元组/列表、或嵌套字典中取第一个可用数值。"""
+    if isinstance(x, (int, float, np.floating)):
+        return float(x)
+    if isinstance(x, (list, tuple)) and len(x) > 0:
+        head = x[0]
+        if isinstance(head, (int, float, np.floating)):
+            return float(head)
+    if isinstance(x, dict):
+        # 常见 key 优先
+        for k in ["acc", "accuracy", "em", "f1", "rewrite_accuracy", "success", "mean"]:
+            if k in x:
+                val = _first_number(x[k])
+                if val is not None:
+                    return val
+        # 兜底：遍历子项
+        for v in x.values():
+            val = _first_number(v)
+            if val is not None:
+                return val
+    return None
+
+def _extract_success_general(ds_name, m):
+    """按数据集的常见结构取主要成功指标，失败则做递归兜底。"""
+    if ds_name in ["cf", "mcf"]:
+        cand = (
+            m.get("rewrite_prompts", {}).get("acc", None)
+            or m.get("rewrite", {}).get("acc", None)
+        )
+        val = _first_number(cand) if cand is not None else _first_number(m)
+        return val if val is not None else 0.0
+
+    if ds_name == "zsre":
+        cand = None
+        if "rewrite" in m:
+            cand = m["rewrite"].get("acc")
+            if cand is None:
+                cand = m["rewrite"].get("em")
+            if cand is None:
+                cand = m["rewrite"].get("f1")
+        val = _first_number(cand) if cand is not None else _first_number(m)
+        return val if val is not None else 0.0
+
+    if ds_name == "mquake":
+        cand = m.get("rewrite_accuracy")
+        if cand is None and "rewrite" in m:
+            cand = m["rewrite"].get("acc")
+        val = _first_number(cand) if cand is not None else _first_number(m)
+        return val if val is not None else 0.0
+
+    val = _first_number(m)
+    return val if val is not None else 0.0
+# ----------- END: robust metric extractors -----------
 
 def main(
     alg_name: str,
@@ -69,6 +126,7 @@ def main(
     dir_name: str,
     num_edits: int = 1,
     use_cache: bool = False,
+    forgetting_eval_interval: int = 0, ## [ADDED] New parameter for forgetting evaluation
 ):
     # Set algorithm-specific variables
     params_class, apply_algo = ALG_DICT[alg_name]
@@ -208,19 +266,13 @@ def main(
         for i, layer in enumerate(hparams.layers):
             P[i,:,:] = get_project(model,tok,layer,hparams)
         torch.save(P, "null_space_project.pt")
-    # hs = get_module_input_output_at_words(
-    #         model,
-    #         tok,
-    #         hparams.layers[-1],
-    #         context_templates=[request["template"] for request in eval_ds],
-    #         words=[request["subject"] for request in eval_ds],
-    #         module_template=hparams.layer_module_tmp,
-    #         fact_token_strategy=hparams.fact_token,
-    #     )[1].T
-    # torch.save(hs, "pre_edit_hs.pt")
-    # del hs
+
     glue_save_location = str(run_dir) + '/' + 'glue_eval/'
     os.makedirs(glue_save_location, exist_ok=True)
+    
+    ## [ADDED] List to store records for the forgetting evaluation
+    history_of_edits = []
+
     cnt = 0
     for record_chunks in chunks(ds, num_edits):
         case_result_template = str(run_dir / "{}_edits-case_{}.json")
@@ -234,8 +286,14 @@ def main(
                 already_finished = False
                 break
         if already_finished:
+            ## [ADDED] Also store the records in history even if skipping computation
+            history_of_edits.extend(record_chunks)
+            cnt += 1
             continue
         
+        ## [ADDED] Store the records for this chunk to test against later.
+        history_of_edits.extend(record_chunks)
+
         # Compute weight changes + record weights that changed
         case_ids = [record["case_id"] for record in record_chunks]
         args_conserve_memory = (
@@ -361,35 +419,90 @@ def main(
                 **etc_args,
             )
         exec_time = time() - start
+        model = edited_model
         cnt+=1
         print("Execution took", exec_time)
+
+                ## --- [ADDED] FORGETTING EVALUATION BLOCK (REVISED) ---
+        total_edits = cnt * num_edits
+        if forgetting_eval_interval > 0 and total_edits > 0 and total_edits % forgetting_eval_interval == 0:
+            print(f"--- Running Forgetting Evaluation at {total_edits} Edits ---")
+
+            forgetting_results = [] # will hold per-case dicts with three accuracies
+
+            # 用当前模型评测所有历史 edits
+            for i, past_record in enumerate(history_of_edits):
+                # 若想彻底跳过慢生成，可把 snips, vec 改成 None, None
+                metrics = ds_eval_method(
+                    edited_model,
+                    tok,
+                    past_record,
+                    snips,
+                    vec
+                )
+
+                # 仅调试用：看前 3 个样本的 metrics 结构，帮助确认提取路径
+                if i < 3:
+                    try:
+                        print("[DEBUG] sample metrics:", json.dumps(metrics, indent=2)[:1200])
+                    except Exception:
+                        print("[DEBUG] sample metrics (non-json-serializable keys):", type(metrics), list(metrics.keys()) if isinstance(metrics, dict) else "not a dict")
+
+                # 1) rewrite accuracy
+                rewrite_corr = np.mean(metrics["rewrite_prompts_correct"])
+                # 2) paraphrase accuracy
+                para_corr    = np.mean(metrics["paraphrase_prompts_correct"])
+                # 3) neighborhood accuracy
+                neigh_corr   = np.mean(metrics["neighborhood_prompts_correct"])
+
+
+                forgetting_results.append({
+                    "case_id": past_record.get("case_id", -1),
+                    "rewrite_acc": float(rewrite_corr),
+                    "paraphrase_acc": float(para_corr),
+                    "neighborhood_acc": float(neigh_corr)
+                })
+
+            if forgetting_results:
+                avg_rewrite  = float(np.mean([r["rewrite_acc"]     for r in forgetting_results]))
+                avg_para     = float(np.mean([r["paraphrase_acc"]  for r in forgetting_results]))
+                avg_neigh    = float(np.mean([r["neighborhood_acc"] for r in forgetting_results]))
+                # 保存报告
+                report_path = run_dir / f"forgetting_report_at_{total_edits}_edits.json"
+                summary_report = {
+                    "checkpoint_total_edits": int(total_edits),
+                    "num_edits_tested": int(len(history_of_edits)),
+                    "average_rewrite_accuracy":  f"{avg_rewrite:.4f}",
+                    "average_paraphrase_accuracy": f"{avg_para:.4f}",
+                    "average_neighborhood_accuracy": f"{avg_neigh:.4f}",
+                    "detailed_results": forgetting_results
+                }
+                with open(report_path, "w") as f:
+                    json.dump(summary_report, f, indent=2)
+
+                print(f"→ rewrite avg: {avg_rewrite:.4f}, paraphrase avg: {avg_para:.4f}, neighborhood avg: {avg_neigh:.4f}")
+                print(f"Forgetting report saved to {report_path}")
+            print("---------------------------------------------------------")
+        ## --- END OF ADDED BLOCK ---
+
+
         # Evaluate new model
-    
         if args.downstream_eval_steps > 0 and cnt % args.downstream_eval_steps == 0:
             glue_results = {
-                        'edit_num': cnt*num_edits,
-                        'case_id': case_ids
-                        }
+                            'edit_num': cnt*num_edits,
+                            'case_id': case_ids
+                            }
 
             out_file = glue_save_location + "case_{}.json".format(record["case_id"])#stores the last case ID of the batch
 
             glue_eval = GLUEEval(model, tok, number_of_tests = 100)
             glue_results = glue_eval.evaluate(glue_results, out_file, nli_flag = True, sst_flag = True, cola_flag=True, rte_flag=True, mmlu_flag = True, mrpc_flag = True)
-                    
+                        
             #store the individual overall result file
             output_filename = out_file.replace('.json', '_glue.json')
             with open(output_filename, "w") as f:
                 json.dump(glue_results, f, indent=4)
-    # hs = get_module_input_output_at_words(
-    #         edited_model,
-    #         tok,
-    #         hparams.layers[-1],
-    #         context_templates=[request["template"] for request in eval_ds],
-    #         words=[request["subject"] for request in eval_ds],
-    #         module_template=hparams.layer_module_tmp,
-    #         fact_token_strategy=hparams.fact_token,
-    #     )[1].T
-    # torch.save(hs, "post_edit_hs_memit.pt")
+
     start = time()
     gen_test_vars = [snips, vec]
     for record in ds:
@@ -418,12 +531,8 @@ def main(
         with open(out_file, "w") as f:
             json.dump(metrics, f, indent=1)
 
-        # Restore original weights
-        # with torch.no_grad():
-        #     for k, v in weights_copy.items():
-        #         nethook.get_parameter(model, k)[...] = v.to("cuda")
+    print("Evaluation took", time() - start)
 
-        print("Evaluation took", time() - start)
 def get_project(model, tok, layer, hparams):
     force_recompute = False
     cov = get_cov(
@@ -442,6 +551,7 @@ def get_project(model, tok, layer, hparams):
     small_singular_indices = (S < threshold).nonzero(as_tuple=True)[0]
     print(len(small_singular_indices))
     return U[:, small_singular_indices] @ U[:, small_singular_indices].T
+
 def window(seq, n=2):
     "Returns a sliding window (of width n) over data from the iterable"
     "   s -> (s0,s1,...s[n-1]), (s1,s2,...,sn), ...                   "
@@ -542,6 +652,13 @@ if __name__ == "__main__":
         default=0,
         help="If we want to do sequential editing or not",
     )
+    ## [ADDED] New argument for the forgetting evaluation experiment
+    parser.add_argument(
+        "--forgetting_eval_interval",
+        type=int,
+        default=0,
+        help="Interval (in number of edits) to test accuracy on all previous edits. If 0, this test is disabled. E.g., 100.",
+    )
     parser.set_defaults(skip_generation_tests=False, conserve_memory=False)
     args = parser.parse_args()
 
@@ -558,4 +675,5 @@ if __name__ == "__main__":
         dir_name=args.alg_name,
         num_edits=args.num_edits,
         use_cache=args.use_cache,
+        forgetting_eval_interval=args.forgetting_eval_interval, ## [MODIFIED] Pass new argument to main
     )

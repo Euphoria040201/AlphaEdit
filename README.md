@@ -55,7 +55,10 @@ results/
 #### 2. Summarize the results  
 To summarize the results, you can use [`experiments/summarize.py`](experiments/summarize.py):
 
-    python -m experiments.summarize --dir_name AlphaEdit --runs run_030
+    python -m experiments.summarize --dir_name AlphaEdit --runs run_049
 
 ## Acknowledgment
 Our code is based on  [``MEMIT``](https://github.com/kmeng01/memit.git) and [``EMMET``](https://github.com/scalable-model-editing/unified-model-editing.git).
+
+
+nohup python3 -u -m experiments.evaluate     --alg_name AlphaEdit     --model_name ./meta-llama-3-8b-instruct     --hparams_fname Llama3-8B.json     --ds_name mcf     --dataset_size_limit 2000     --num_edits 100     --downstream_eval_steps 20  --forgetting_eval_interval 100 > logs/alphaedit_run_$(date +%m%d_%H%M).log 2>&1 &
