@@ -7,7 +7,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 # ====== 修改为你的目录 ======
-RUN_DIR = "/root/autodl-tmp/sic_lyu/AlphaEdit/results/AlphaEdit/run_052"
+RUN_DIR = "/root/autodl-tmp/sic_lyu/AlphaEdit/results/AlphaEdit/run_057"
 # ===========================
 
 pattern = os.path.join(RUN_DIR, "forgetting_report_at_*_edits.json")

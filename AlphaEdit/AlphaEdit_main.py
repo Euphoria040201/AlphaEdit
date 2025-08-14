@@ -6,7 +6,7 @@ import csv
 import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
+from scipy.linalg import svd, qr
 from rome.layer_stats import layer_stats
 from util import nethook
 from util.generate import generate_fast
@@ -18,6 +18,77 @@ from .AlphaEdit_hparams import AlphaEditHyperParams
 # Cache variable(s)
 CONTEXT_TEMPLATES_CACHE = None
 COV_CACHE = {}
+def update_projector_from_P_and_K(P0, Knew, tol=1e-10):
+    """
+    P0: (d,d) projector onto left-nullspace(K0)
+    Knew: (d, m)
+    returns: P_new (same type as P0), Q_combined (same type)
+    """
+    # --- 记录原始类型/设备/精度 ---
+    is_torch = isinstance(P0, torch.Tensor)
+    if is_torch:
+        orig_device = P0.device
+        orig_dtype = P0.dtype
+        P0_np = P0.detach().cpu().numpy()
+    else:
+        P0_np = P0
+
+    if isinstance(Knew, torch.Tensor):
+        Knew_np = Knew.detach().cpu().numpy()
+    else:
+        Knew_np = Knew
+
+    # 转为 float64 并对称化，提升稳定性
+    P0_np = P0_np.astype(np.float64, copy=False)
+    Knew_np = Knew_np.astype(np.float64, copy=False)
+    P0_np = 0.5 * (P0_np + P0_np.T)
+
+    d = P0_np.shape[0]
+    I = np.eye(d, dtype=np.float64)
+
+    # 1) 在 rowspace(K0) 上的分量：R = (I - P0) Knew
+    R = (I - P0_np) @ Knew_np
+
+    if R.size == 0:
+        P_new_np = P0_np
+        Q_combined_np = np.zeros((d, 0), dtype=np.float64)
+    else:
+        # 2) SVD 判秩，必要时兜底到 numpy 实现
+        try:
+            Ur, Sr, Vtr = svd(R, full_matrices=False)
+        except Exception:
+            Ur, Sr, Vtr = np.linalg.svd(R, full_matrices=False)
+
+        thresh = max(R.shape) * np.finfo(Sr.dtype).eps * (Sr[0] if Sr.size else 0.0)
+        rank_R = int((Sr > max(thresh, tol)).sum())
+        if rank_R == 0:
+            P_new_np = P0_np
+            Q_combined_np = np.zeros((d, 0), dtype=np.float64)
+        else:
+            Q_add = Ur[:, :rank_R]  # d x rank_R
+
+            # 3) 用对称特征分解从 P0 提取 rowspace 基 Q0（eigs < 0.5）
+            evals, evecs = np.linalg.eigh(P0_np)  # 升序
+            mask_row = evals < 0.5
+            if np.any(mask_row):
+                Q0 = evecs[:, mask_row]
+                stacked = np.concatenate([Q0, Q_add], axis=1)
+            else:
+                stacked = Q_add
+
+            # 4) 拼接并 QR 正交化
+            Q_combined_np, _ = qr(stacked, mode='economic')
+
+            # 5) 新投影
+            P_new_np = np.eye(d, dtype=np.float64) - Q_combined_np @ Q_combined_np.T
+
+    # --- 返回与输入同类型 ---
+    if is_torch:
+        P_new = torch.from_numpy(P_new_np).to(device=orig_device, dtype=orig_dtype)
+        Q_combined = torch.from_numpy(Q_combined_np).to(device=orig_device, dtype=orig_dtype)
+        return P_new, Q_combined
+    else:
+        return P_new_np, Q_combined_np
 
 def apply_AlphaEdit_to_model(
     model: AutoModelForCausalLM,
@@ -109,16 +180,12 @@ def apply_AlphaEdit_to_model(
 
         # Get current model activations
         layer_ks = compute_ks(model, tok, requests, hparams, layer, context_templates).T
+        # 用新加入的 layer_ks 更新投影矩阵
+        P[i,:,:], _ = update_projector_from_P_and_K(P[i,:,:], layer_ks.cpu().numpy())
+
         print(f"Writing {layer_ks.size(1)} key/value pair(s) into layer {layer}")
 
-
-        # === 取该层的 H = E[aa^T]（与 GPTQ 同源的 mom2） ===
-        #layer_name = hparams.rewrite_module_tmp.format(layer)
-        #H = get_cov(
-        #    model, tok, layer_name,
-        #    hparams.mom2_dataset, hparams.mom2_n_samples, hparams.mom2_dtype,
-        #    inv=False, force_recompute=False
-        #.to(layer_ks.device, dtype=torch.float32)  # [d_in, d_in]
+        
 
         # Compute residual error
         cur_zs = get_module_input_output_at_words(
@@ -139,8 +206,6 @@ def apply_AlphaEdit_to_model(
         upd_matrix = torch.linalg.solve(
                 P[i,:,:].cuda() @ (layer_ks @ layer_ks.T + cache_c[i,:,:].cuda()) + hparams.L2*torch.eye(layer_ks.shape[0], dtype=torch.float,device="cuda"), P[i,:,:].cuda() @ layer_ks @ resid.T
         )
-
-
         # Adjust update matrix shape
         weight_name = f"{hparams.rewrite_module_tmp.format(layer)}.weight"
         upd_matrix = upd_matrix_match_shape(upd_matrix, weights[weight_name].shape)
@@ -151,7 +216,6 @@ def apply_AlphaEdit_to_model(
         # Clear GPU memory
         #del U,S,cov
         for x in [layer_ks, cur_zs, targets, upd_matrix]:
-        #for x in [layer_ks, cur_zs, targets, upd_matrix, H, KKt, Ccum, A, B]:
             x.cpu()
             del x
         torch.cuda.empty_cache()
