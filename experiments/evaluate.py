@@ -126,8 +126,11 @@ def main(
     dir_name: str,
     num_edits: int = 1,
     use_cache: bool = False,
-    forgetting_eval_interval: int = 0, ## [ADDED] New parameter for forgetting evaluation
+    forgetting_eval_interval: int = 0,
+    save_every: int = 0,                 # ★ 新增
+    checkpoint_subdir: str = "checkpoints" # ★ 新增
 ):
+
     # Set algorithm-specific variables
     params_class, apply_algo = ALG_DICT[alg_name]
 
@@ -152,6 +155,9 @@ def main(
         run_dir = RESULTS_DIR / dir_name / f"run_{str(run_id).zfill(3)}"
         run_dir.mkdir(parents=True, exist_ok=True)
     print(f"Results will be stored at {run_dir}")
+    ckpt_root = run_dir / checkpoint_subdir
+    ckpt_root.mkdir(parents=True, exist_ok=True)
+
     if "MEMIT" in alg_name:
     # Get run hyperparameters
         params_path = (
@@ -422,7 +428,35 @@ def main(
         model = edited_model
         cnt+=1
         print("Execution took", exec_time)
+        # ---- 每隔 save_every 次“样本级编辑”保存一次模型 ----
+        if save_every != 0:
+            total_edits = cnt * num_edits
+            if save_every > 0 and total_edits % save_every == 0:
+                ckpt_dir = ckpt_root / f"edits_{total_edits:06d}"
+                ckpt_dir.mkdir(parents=True, exist_ok=True)
+                print(f"[Checkpoint] Saving model at {ckpt_dir} after {total_edits} edits ...")
+                try:
+                    # 保存模型与分词器；自动使用 safetensors（如已安装）
+                    model.save_pretrained(
+                        ckpt_dir,
+                        safe_serialization=True,
+                        max_shard_size="5GB"
+                    )
+                    tok.save_pretrained(ckpt_dir)
+                    # 记录一点元信息
+                    with open(ckpt_dir / "meta.json", "w") as f:
+                        json.dump({
+                            "total_edits": int(total_edits),
+                            "last_case_ids": case_ids,
+                            "layers": hparams.layers,
+                            "rewrite_module_tmp": hparams.rewrite_module_tmp,
+                            "exec_time_sec_last_chunk": float(exec_time)
+                        }, f, indent=2)
+                except Exception as e:
+                    print(f"[Checkpoint][WARN] save failed: {e}")
+        # ----------------------------------------------------
 
+        '''
                 ## --- [ADDED] FORGETTING EVALUATION BLOCK (REVISED) ---
         total_edits = cnt * num_edits
         if forgetting_eval_interval > 0 and total_edits > 0 and total_edits % forgetting_eval_interval == 0:
@@ -532,7 +566,7 @@ def main(
             json.dump(metrics, f, indent=1)
 
     print("Evaluation took", time() - start)
-
+    '''
 def get_project(model, tok, layer, hparams):
     force_recompute = False
     cov = get_cov(
@@ -659,6 +693,19 @@ if __name__ == "__main__":
         default=0,
         help="Interval (in number of edits) to test accuracy on all previous edits. If 0, this test is disabled. E.g., 100.",
     )
+    parser.add_argument(
+    "--save_every",
+    type=int,
+    default=100,
+    help="Save the whole model every N edits (sample-level). 0 = disable."
+    )
+    parser.add_argument(
+        "--checkpoint_subdir",
+        type=str,
+        default="checkpoints",
+        help="Subdirectory under the run dir to store checkpoints."
+    )
+
     parser.set_defaults(skip_generation_tests=False, conserve_memory=False)
     args = parser.parse_args()
 
@@ -676,4 +723,6 @@ if __name__ == "__main__":
         num_edits=args.num_edits,
         use_cache=args.use_cache,
         forgetting_eval_interval=args.forgetting_eval_interval, ## [MODIFIED] Pass new argument to main
+        save_every=args.save_every,
+        checkpoint_subdir=args.checkpoint_subdir,
     )

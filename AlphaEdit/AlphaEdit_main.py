@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import csv
 import numpy as np
 import torch
+import time
+
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from scipy.linalg import svd, qr
 from rome.layer_stats import layer_stats
@@ -15,38 +17,39 @@ from util.globals import *
 from .compute_ks import compute_ks
 from .compute_z import compute_z, get_module_input_output_at_words, find_fact_lookup_idx
 from .AlphaEdit_hparams import AlphaEditHyperParams
+
 # Cache variable(s)
 CONTEXT_TEMPLATES_CACHE = None
 COV_CACHE = {}
-def update_projector_from_P_and_K(P0, Knew, tol=1e-10):
-    is_torch = isinstance(P0, torch.Tensor)
-    if is_torch:
-        dev, dt = P0.device, P0.dtype
-        P0 = P0.detach().cpu().numpy()
-    if isinstance(Knew, torch.Tensor):
-        Knew = Knew.detach().cpu().numpy()
 
-    P0 = 0.5 * (P0 + P0.T)  # 对称化以稳数值
-    d = P0.shape[0]
-    # 关键修正：找新增方向
-    R = P0 @ Knew
-    if R.size == 0:
-        P_new = P0
-    else:
-        Ur, Sr, Vtr = svd(R, full_matrices=False)
-        thr = max(R.shape) * np.finfo(Sr.dtype).eps * (Sr[0] if Sr.size else 0.0)
-        r = int((Sr > max(thr, tol)).sum())
-        if r == 0:
-            P_new = P0
-        else:
-            Q_add = Ur[:, :r]         # 新增正交方向（已在旧零空间内）
-            P_new = P0 - Q_add @ Q_add.T
+# ---- 简单计时容器（新增）----
+update_timing = {
+    "per_layer": [],           # 每层明细
+    "total_solve_s": 0.0,      # 所有层的求解总时长
+    "total_proj_s": 0.0,       # 所有层的投影更新总时长
+    "total_all_s": 0.0         # 整个函数总时长
+}
 
-    P_new = 0.5 * (P_new + P_new.T)  # 再次对称化
-    if is_torch:
-        return torch.as_tensor(P_new, device=dev, dtype=dt), torch.as_tensor(Ur[:, :r] if R.size and r>0 else np.zeros((d,0)))
-    else:
-        return P_new, (Ur[:, :r] if R.size and r>0 else np.zeros((d,0)))
+def update_projector_from_P_and_K(P0: torch.Tensor, Knew: torch.Tensor, tol: float = 1e-10):
+    device, dtype = P0.device, P0.dtype
+    # R = P0 @ Knew  （均在同一 device/dtype）
+    R = P0 @ Knew.to(device=device, dtype=dtype)
+
+    if R.numel() == 0 or R.shape[1] == 0:
+        return P0, torch.zeros((P0.size(0), 0), device=device, dtype=dtype)
+
+    U, S, Vh = torch.linalg.svd(R, full_matrices=False)
+    eps  = torch.finfo(S.dtype).eps
+    thr  = max(R.shape) * eps * (S[0] if S.numel() else torch.tensor(0., device=device, dtype=dtype))
+    r    = int((S > torch.maximum(thr, torch.tensor(tol, device=device, dtype=dtype))).sum().item())
+
+    if r == 0:
+        return P0, torch.zeros((P0.size(0), 0), device=device, dtype=dtype)
+
+    Q_add = U[:, :r]
+    P_new = P0 - Q_add @ Q_add.transpose(-2, -1)
+    # 可选：P_new = 0.5 * (P_new + P_new.transpose(-2, -1))
+    return P_new, Q_add
 
 
 def apply_AlphaEdit_to_model(
@@ -57,11 +60,14 @@ def apply_AlphaEdit_to_model(
     cache_template: Optional[str] = None,
     cache_c = None,
     P = None,
+    apply_woodbury = True,
 ) -> Dict[str, Tuple[torch.Tensor]]:
     """
     Executes the MEMIT update algorithm for the specified update at the specified layer
     Invariant: model at beginning of function == model at end of function
     """
+    global update_timing
+    t_all0 = time.perf_counter()
 
     # Update target and print info
     requests = deepcopy(requests)
@@ -135,15 +141,12 @@ def apply_AlphaEdit_to_model(
     zs = torch.stack(z_list, dim=1)
 
     for i, layer in enumerate(hparams.layers):
+        t_layer0 = time.perf_counter()
         print(f"\n\nLAYER {layer}\n")
 
         # Get current model activations
         layer_ks = compute_ks(model, tok, requests, hparams, layer, context_templates).T
-        
-
         print(f"Writing {layer_ks.size(1)} key/value pair(s) into layer {layer}")
-
-        
 
         # Compute residual error
         cur_zs = get_module_input_output_at_words(
@@ -160,12 +163,48 @@ def apply_AlphaEdit_to_model(
 
         repeat_factor = (layer_ks.size(1) // targets.size(1))
         targets = targets.repeat_interleave(repeat_factor, dim=1)
-        resid = targets / (len(hparams.layers) - i)  # Distribute residual across layers
-        upd_matrix = torch.linalg.solve(
-                P[i,:,:].cuda() @ (layer_ks @ layer_ks.T + cache_c[i,:,:].cuda()) + hparams.L2*torch.eye(layer_ks.shape[0], dtype=torch.float,device="cuda"), P[i,:,:].cuda() @ layer_ks @ resid.T
-        )
-        # 用新加入的 layer_ks 更新投影矩阵
-        P[i,:,:], _ = update_projector_from_P_and_K(P[i,:,:], layer_ks.cpu().numpy())
+        lam = float(hparams.L2)
+        resid = targets / (len(hparams.layers) - i)  # d×r
+
+        # -------------- 求解计时开始（solve）--------------
+        t_solve0 = time.perf_counter()
+        if apply_woodbury:
+            # ----- Low-rank (Woodbury) with L2 -----
+            K_t = layer_ks.to("cuda")            # d×r
+            P_i = P[i, :, :].to("cuda")          # d×d
+            Y   = P_i @ K_t                      # d×r
+            S0  = K_t.T @ Y                      # r×r = K^T P K
+            r   = S0.size(0)
+            Ir  = torch.eye(r, device=S0.device, dtype=S0.dtype)
+            eps = 1e-6 if S0.dtype == torch.float32 else 1e-12
+
+            # Cholesky on (lam I + S0)
+            L = torch.linalg.cholesky(S0 + lam * Ir + eps * Ir)   # lower, r×r
+
+            # Solve (lam I + S0) B = Y^T  ->  B = (lam I + S0)^{-1} Y^T
+            YT = Y.T                                              # r×d
+            B  = torch.cholesky_solve(YT, L)                      # r×d
+
+            # Δ = resid @ B
+            upd_matrix = resid @ B
+        else:
+            d = layer_ks.shape[0]
+            Id = torch.eye(d, device="cuda", dtype=layer_ks.dtype)
+            upd_matrix = torch.linalg.solve(
+                P[i,:,:].cuda() @ (layer_ks @ layer_ks.T) + lam * Id,
+                P[i,:,:].cuda() @ layer_ks @ resid.T,
+            )
+        solve_s = time.perf_counter() - t_solve0
+        update_timing["total_solve_s"] += solve_s
+        # -------------- 求解计时结束 -----------------------
+
+        # -------------- 投影矩阵更新计时开始（projector）------
+        t_proj0 = time.perf_counter()
+        P[i,:,:], _ = update_projector_from_P_and_K(P[i,:,:], layer_ks.detach())
+        proj_s = time.perf_counter() - t_proj0
+        update_timing["total_proj_s"] += proj_s
+        # -------------- 投影矩阵更新计时结束 ------------------
+
         # Adjust update matrix shape
         weight_name = f"{hparams.rewrite_module_tmp.format(layer)}.weight"
         upd_matrix = upd_matrix_match_shape(upd_matrix, weights[weight_name].shape)
@@ -173,15 +212,31 @@ def apply_AlphaEdit_to_model(
         print("upd norm", torch.linalg.norm(upd_matrix))
         with torch.no_grad():
             weights[weight_name][...] = weights[weight_name] + upd_matrix
+
         # Clear GPU memory
-        #del U,S,cov
         for x in [layer_ks, cur_zs, targets, upd_matrix]:
             x.cpu()
             del x
         torch.cuda.empty_cache()
+
+        layer_total_s = time.perf_counter() - t_layer0
+        update_timing["per_layer"].append({
+            "layer": int(layer),
+            "solve_s": solve_s,
+            "proj_update_s": proj_s,
+            "layer_total_s": layer_total_s
+        })
+        print(f"[Timing] layer {layer}: solve={solve_s:.4f}s, proj_update={proj_s:.4f}s, total={layer_total_s:.4f}s")
+
+    # 累加统计 cache_c
     for i, layer in enumerate(hparams.layers):
         layer_ks = compute_ks(model, tok, requests, hparams, layer, context_templates).T
         cache_c[i,:,:] += layer_ks.cpu() @ layer_ks.cpu().T
+
+    update_timing["total_all_s"] += (time.perf_counter() - t_all0)
+    print(f"[Timing][Totals] solve={update_timing['total_solve_s']:.4f}s, "
+          f"proj_update={update_timing['total_proj_s']:.4f}s, "
+          f"all={update_timing['total_all_s']:.4f}s")
 
     print(f"Deltas successfully computed for {list(weights.keys())}")
     return model, cache_c

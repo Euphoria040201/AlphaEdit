@@ -41,5 +41,8 @@ MODEL_NAME_TO_MAXIMUM_CONTEXT_LENGTH_MAP = {
     "llama3-8b-instruct": 4096,
     "eleutherai_gpt-j-6b": 2048,
     "gpt2-large": 1024,
-    "gpt2-medium": 1024
+    "gpt2-medium": 1024,
+    "qwen2.5-1.5b-instruct": 32768, 
+    "qwen2.5-3b-instruct":   32768,
+    "qwen2.5-7b-instruct":   32768,
 }

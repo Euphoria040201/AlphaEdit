@@ -7,7 +7,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 # ====== 修改为你的目录 ======
-RUN_DIR = "/root/autodl-tmp/sic_lyu/AlphaEdit/results/AlphaEdit/run_077"
+RUN_DIR = "/home/xinyu/work/xinyu/Project/results/AlphaEdit/run_072(gpt2-xl_batchsize25_ourmethod)"
 # ===========================
 
 pattern = os.path.join(RUN_DIR, "forgetting_report_at_*_edits.json")

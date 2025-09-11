@@ -16,3 +16,20 @@ meta-llama-3-8b-instruct/
 # optional: logs & local junk
 *.log
 .ipynb_checkpoints/
+wheels/
+glue_eval/__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+wheels/
+*.whl
+*.tar.gz
+*.egg-info/
+*.dist-info/
+
+logs/
+*.log
+*.pid
+nohup.out
+spectra/
